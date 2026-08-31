@@ -1,0 +1,106 @@
+name: Synchronize integration branch after main
+
+on:
+  workflow_call:
+    inputs:
+      production_branch:
+        description: Accepted production branch
+        required: false
+        type: string
+        default: main
+      integration_branch:
+        description: Persistent integration and review branch
+        required: false
+        type: string
+        default: dev
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  synchronize:
+    name: Fast-forward integration branch
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == inputs.production_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: integration-sync-${{ github.repository }}-${{ inputs.integration_branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate and fast-forward integration branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PRODUCTION_BRANCH: ${{ inputs.production_branch }}
+          INTEGRATION_BRANCH: ${{ inputs.integration_branch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "$PRODUCTION_BRANCH" == "$INTEGRATION_BRANCH" ]]; then
+            echo "::error::Production and integration branches must be different."
+            exit 1
+          fi
+
+          branch_pattern='^[A-Za-z0-9][A-Za-z0-9._/-]*$'
+          if [[ ! "$PRODUCTION_BRANCH" =~ $branch_pattern ]] ||
+             [[ ! "$INTEGRATION_BRANCH" =~ $branch_pattern ]]; then
+            echo "::error::A configured branch name is invalid."
+            exit 1
+          fi
+
+          production_sha="$(
+            gh api "repos/$REPOSITORY/git/ref/heads/$PRODUCTION_BRANCH" \
+              --jq '.object.sha'
+          )"
+          integration_sha="$(
+            gh api "repos/$REPOSITORY/git/ref/heads/$INTEGRATION_BRANCH" \
+              --jq '.object.sha'
+          )"
+
+          if [[ "$production_sha" == "$integration_sha" ]]; then
+            echo "Integration branch is already synchronized at $production_sha."
+            echo "### Integration branch synchronization" >> "$GITHUB_STEP_SUMMARY"
+            echo "No update required; both branches reference \`$production_sha\`." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          comparison_status="$(
+            gh api \
+              "repos/$REPOSITORY/compare/$integration_sha...$production_sha" \
+              --jq '.status'
+          )"
+
+          if [[ "$comparison_status" != "ahead" ]]; then
+            echo "::error::Refusing to update $INTEGRATION_BRANCH: comparison to $PRODUCTION_BRANCH is $comparison_status, not a safe fast-forward."
+            exit 1
+          fi
+
+          gh api \
+            --method PATCH \
+            "repos/$REPOSITORY/git/refs/heads/$INTEGRATION_BRANCH" \
+            --field sha="$production_sha" \
+            --field force=false \
+            --silent
+
+          synchronized_sha="$(
+            gh api "repos/$REPOSITORY/git/ref/heads/$INTEGRATION_BRANCH" \
+              --jq '.object.sha'
+          )"
+
+          if [[ "$synchronized_sha" != "$production_sha" ]]; then
+            echo "::error::Integration branch verification failed after update."
+            exit 1
+          fi
+
+          echo "Fast-forwarded $INTEGRATION_BRANCH from $integration_sha to $production_sha."
+          echo "### Integration branch synchronization" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fast-forwarded \`$INTEGRATION_BRANCH\` to \`$production_sha\`." \
+            >> "$GITHUB_STEP_SUMMARY"
